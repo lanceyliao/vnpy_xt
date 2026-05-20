@@ -1,7 +1,10 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections.abc import Callable
-from threading import Thread
+from threading import Thread, Event, Lock
 from typing import Any
+from copy import copy
+import time
+import threading
 
 from xtquant import (
     xtdata,
@@ -39,11 +42,13 @@ from vnpy.trader.object import (
     AccountData,
     PositionData,
     TradeData,
-    Offset
+    Offset,
+    BarData
 )
 from vnpy.trader.constant import (
     Exchange,
-    Product
+    Product,
+    Interval
 )
 from vnpy.trader.utility import (
     ZoneInfo,
@@ -53,6 +58,9 @@ from vnpy.trader.utility import (
 
 from .xt_config import VIP_ADDRESS_LIST, LISTEN_PORT
 
+
+# 事件类型
+EVENT_BAR = "eBarGen"
 
 # 交易所映射
 EXCHANGE_VT2XT: dict[Exchange, str] = {
@@ -114,6 +122,14 @@ ORDERTYPE_XT2VT: dict[int, OrderType] = {
 
 # 其他常量
 CHINA_TZ = ZoneInfo("Asia/Shanghai")       # 中国时区
+
+# A股交易时段（分钟）
+STOCK_SESSION_WINDOWS: tuple[tuple[int, int], ...] = (
+    (9 * 60 + 30, 11 * 60 + 30),   # 上午 9:30 ~ 11:30
+    (13 * 60, 15 * 60),             # 下午 13:00 ~ 15:00
+)
+STOCK_SESSION_START_MINUTES: tuple[int, ...] = tuple(start for start, _ in STOCK_SESSION_WINDOWS)
+STOCK_SESSION_END_MINUTES: tuple[int, ...] = tuple(end for _, end in STOCK_SESSION_WINDOWS)  # (690, 900) 即 11:30, 15:00
 
 
 # 全局缓存字典
@@ -216,6 +232,28 @@ class XtGateway(BaseGateway):
         """查询历史数据"""
         return None
 
+    def on_tick(self, tick: TickData) -> None:
+        """推送 tick 数据（带收盘过滤）"""
+        # 1. 墙钟 >= 15:00 停推（防延迟 tick 假触发信号）
+        now = datetime.now(CHINA_TZ)
+        wall_minute = now.hour * 60 + now.minute
+        if wall_minute >= 15 * 60:
+            return
+
+        # # 2. tick 数据时间 < 9:25 丢弃（参考 tq_gateway），暂不启用，待测试xt实际行为
+        # tick_dt = tick.datetime
+        # if tick_dt.tzinfo is None:
+        #     tick_dt = tick_dt.replace(tzinfo=CHINA_TZ)
+        # tick_minute = tick_dt.hour * 60 + tick_dt.minute
+        # if tick_minute < 9 * 60 + 25:  # 9:25
+        #     return
+
+        super().on_tick(tick)
+
+    def on_bar(self, bar: BarData) -> None:
+        """推送K线数据"""
+        self.on_event(EVENT_BAR, bar)
+
     def on_order(self, order: OrderData) -> None:
         """推送委托数据"""
         self.orders[order.orderid] = order
@@ -227,6 +265,10 @@ class XtGateway(BaseGateway):
 
     def close(self) -> None:
         """关闭接口"""
+        # 关闭行情接口
+        self.md_api.close()
+        
+        # 关闭交易接口
         if self.trading:
             self.td_api.close()
 
@@ -240,6 +282,9 @@ class XtGateway(BaseGateway):
         func = self.query_functions.pop(0)
         func()
         self.query_functions.append(func)
+
+        # 每秒触发行情 API 的定时任务
+        self.md_api.process_timer()
 
     def init_query(self) -> None:
         """初始化查询任务"""
@@ -266,78 +311,128 @@ class XtMdApi:
         self.futures_active: bool = False
         self.option_active: bool = False
 
+        # Tick 状态管理
+        self.symbol_tick_states: dict[str, dict] = {}
+
+        # K线状态管理
+        self.symbol_bar_states: dict[str, dict] = {}  # 包含 bar 对象和补漏状态
+
+        # 订阅批量管理（每秒收集一次）
+        self.pending_subscribe: set[str] = set()
+        self.subscribe_lock: threading.Lock = threading.Lock()
+        self.whole_quote_seqs: list = []  # subscribe_whole_quote 返回的订阅号，close 时反订阅
+
     def onMarketData(self, data: dict) -> None:
-        """行情推送回调"""
-        for xt_symbol, buf in data.items():
-            for d in buf:
-                symbol, xt_exchange = xt_symbol.split(".")
-                exchange = EXCHANGE_XT2VT[xt_exchange]
+        """行情推送回调（subscribe_whole_quote 格式：{code: dict}）
+        
+        回调格式（来自 xtdata.subscribe_whole_quote 文档）：
+            datas: dict
+                {'000001.SZ': {'time': 1733118954000, 'lastPrice': 11.39, ...}}
+        """
+        for xt_symbol, d in data.items():
+            # 获取 tick 状态
+            state = self.symbol_tick_states.get(xt_symbol)
+            if state is None:
+                continue
 
-                tick: TickData = TickData(
-                    symbol=symbol,
-                    exchange=exchange,
-                    datetime=generate_datetime(d["time"]),
-                    volume=d["volume"],
-                    turnover=d["amount"],
-                    open_interest=d["openInt"],
-                    gateway_name=self.gateway_name
-                )
+            # subscribe_whole_quote 回调：d 为单条 dict
+            if not isinstance(d, dict):
+                continue
+            
+            # 提取必需字段
+            tick_ms = d.get("time")
+            last_price = d.get("lastPrice")
+            if tick_ms is None or last_price is None:
+                continue
 
-                contract = symbol_contract_map[tick.vt_symbol]
-                tick.name = contract.name
+            symbol, xt_exchange = xt_symbol.split(".")
+            exchange = EXCHANGE_XT2VT[xt_exchange]
 
-                bp_data: list = d["bidPrice"]
-                ap_data: list = d["askPrice"]
-                bv_data: list = d["bidVol"]
-                av_data: list = d["askVol"]
+            # 逆序重复过滤
+            if tick_ms <= state["last_tick_ms"]:
+                continue
+            if tick_ms < state["anchor_ms"]:
+                continue
 
-                tick.bid_price_1 = round_to(bp_data[0], contract.pricetick)
-                tick.bid_price_2 = round_to(bp_data[1], contract.pricetick)
-                tick.bid_price_3 = round_to(bp_data[2], contract.pricetick)
-                tick.bid_price_4 = round_to(bp_data[3], contract.pricetick)
-                tick.bid_price_5 = round_to(bp_data[4], contract.pricetick)
+            state["last_tick_ms"] = tick_ms
 
-                tick.ask_price_1 = round_to(ap_data[0], contract.pricetick)
-                tick.ask_price_2 = round_to(ap_data[1], contract.pricetick)
-                tick.ask_price_3 = round_to(ap_data[2], contract.pricetick)
-                tick.ask_price_4 = round_to(ap_data[3], contract.pricetick)
-                tick.ask_price_5 = round_to(ap_data[4], contract.pricetick)
+            tick: TickData = TickData(
+                symbol=symbol,
+                exchange=exchange,
+                datetime=generate_datetime(tick_ms),
+                volume=d.get("volume", 0),
+                turnover=d.get("amount", 0),
+                open_interest=d.get("openInt", 0),
+                gateway_name=self.gateway_name
+            )
 
-                tick.bid_volume_1 = bv_data[0]
-                tick.bid_volume_2 = bv_data[1]
-                tick.bid_volume_3 = bv_data[2]
-                tick.bid_volume_4 = bv_data[3]
-                tick.bid_volume_5 = bv_data[4]
+            contract = symbol_contract_map.get(tick.vt_symbol)
+            if not contract:
+                continue
 
-                tick.ask_volume_1 = av_data[0]
-                tick.ask_volume_2 = av_data[1]
-                tick.ask_volume_3 = av_data[2]
-                tick.ask_volume_4 = av_data[3]
-                tick.ask_volume_5 = av_data[4]
+            tick.name = contract.name
 
-                tick.last_price = round_to(d["lastPrice"], contract.pricetick)
-                tick.open_price = round_to(d["open"], contract.pricetick)
-                tick.high_price = round_to(d["high"], contract.pricetick)
-                tick.low_price = round_to(d["low"], contract.pricetick)
-                tick.pre_close = round_to(d["lastClose"], contract.pricetick)
+            bp_data: list = d.get("bidPrice", [0] * 5)
+            ap_data: list = d.get("askPrice", [0] * 5)
+            bv_data: list = d.get("bidVol", [0] * 5)
+            av_data: list = d.get("askVol", [0] * 5)
 
-                if tick.vt_symbol in symbol_limit_map:
-                    tick.limit_up, tick.limit_down = symbol_limit_map[tick.vt_symbol]
+            tick.bid_price_1 = round_to(bp_data[0], contract.pricetick)
+            tick.bid_price_2 = round_to(bp_data[1], contract.pricetick)
+            tick.bid_price_3 = round_to(bp_data[2], contract.pricetick)
+            tick.bid_price_4 = round_to(bp_data[3], contract.pricetick)
+            tick.bid_price_5 = round_to(bp_data[4], contract.pricetick)
 
-                # 判断收盘状态
-                tick.extra = {
-                    "raw": d,
-                    "market_closed": False,
-                }
+            tick.ask_price_1 = round_to(ap_data[0], contract.pricetick)
+            tick.ask_price_2 = round_to(ap_data[1], contract.pricetick)
+            tick.ask_price_3 = round_to(ap_data[2], contract.pricetick)
+            tick.ask_price_4 = round_to(ap_data[3], contract.pricetick)
+            tick.ask_price_5 = round_to(ap_data[4], contract.pricetick)
 
-                # 非衍生品可以通过openInt字段判断证券状态
-                if contract.product not in {Product.FUTURES, Product.OPTION}:
-                    tick.extra["market_closed"] = d["openInt"] == 15
-                # 衍生品该字段为持仓量，需要通过结算价判断
-                elif d["settlementPrice"] > 0:
-                    tick.extra["market_closed"] = True
+            tick.bid_volume_1 = bv_data[0]
+            tick.bid_volume_2 = bv_data[1]
+            tick.bid_volume_3 = bv_data[2]
+            tick.bid_volume_4 = bv_data[3]
+            tick.bid_volume_5 = bv_data[4]
 
-                self.gateway.on_tick(tick)
+            tick.ask_volume_1 = av_data[0]
+            tick.ask_volume_2 = av_data[1]
+            tick.ask_volume_3 = av_data[2]
+            tick.ask_volume_4 = av_data[3]
+            tick.ask_volume_5 = av_data[4]
+
+            tick.last_price = round_to(last_price, contract.pricetick)
+            tick.open_price = round_to(d.get("open", 0), contract.pricetick)
+            tick.high_price = round_to(d.get("high", 0), contract.pricetick)
+            tick.low_price = round_to(d.get("low", 0), contract.pricetick)
+            tick.pre_close = round_to(d.get("lastClose", 0), contract.pricetick)
+
+            if tick.vt_symbol in symbol_limit_map:
+                tick.limit_up, tick.limit_down = symbol_limit_map[tick.vt_symbol]
+
+            # 判断收盘状态（使用 openInt 字段 - 证券状态编码）
+            # 
+            # XT tick 的 openInt 字段含义（实测）：
+            #   股票：0,10=未知, 1=停牌, 11=开盘前S, 12=集合竞价C, 13=连续交易T, 14=休市B, 
+            #         15=闭市E, 16=波动性中断V, 17=临时停牌P, 18=收盘集合竞价U, 19=盘中集合竞价M,
+            #         20=暂停交易至闭市N, 21=获取字段异常, 22=盘后固定价格, 23=盘后固定价格完毕
+            #   期货：0=未知, 1=开盘前S, 2=集合竞价C, 3=连续交易T, 4=休市B, 5=闭市E
+            tick.extra = {
+                "raw": d,
+                "market_closed": False,
+            }
+
+            open_int = d.get("openInt", 0)
+            settlement_price = d.get("settlementPrice", 0)
+
+            # 非衍生品：openInt 是证券状态编码（15=闭市E, 18=收盘集合竞价U）
+            if contract.product not in {Product.FUTURES, Product.OPTION}:
+                tick.extra["market_closed"] = open_int == 15
+            # 衍生品：openInt 是持仓量，通过结算价判断（期货 openInt: 5=闭市E）
+            elif settlement_price > 0:
+                tick.extra["market_closed"] = True
+
+            self.gateway.on_tick(tick)
 
     def connect(
         self,
@@ -373,6 +468,247 @@ class XtMdApi:
 
         self.query_contracts()
 
+    def process_timer(self) -> None:
+        """定时任务（每秒触发）"""
+        # 批量订阅新增标的
+        self._batch_subscribe()
+        
+        # 轮询 K线数据
+        self._poll_kline()
+
+    def _batch_subscribe(self) -> None:
+        """批量订阅新增标的"""
+        with self.subscribe_lock:
+            if not self.pending_subscribe:
+                return
+
+            new_codes = sorted(self.pending_subscribe)
+            self.pending_subscribe.clear()
+
+        # 批量注册 K线全推（首次调用 get_full_kline 注册客户端 1m 全推）
+        # 注意：后续 _poll_kline 会全量获取所有已订阅合约的 K线，不是增量
+        trading_date = datetime.now(CHINA_TZ).strftime("%Y%m%d")
+        xtdata.get_full_kline([], new_codes, "1m", "", trading_date, 2)
+
+        # 批量订阅全推 tick（增量订阅，避免重复 callback）
+        seq = xtdata.subscribe_whole_quote(
+            code_list=new_codes,
+            callback=self.onMarketData
+        )
+        if seq:
+            self.whole_quote_seqs.append(seq)
+        self.subscribed.update(new_codes)
+        self.gateway.write_log(f"批量订阅 {len(new_codes)} 个新增合约，seq={seq}")
+
+    def _poll_kline(self) -> None:
+        """轮询 K线数据（推送 [-2] 已完成的 bar，收盘时补发 [-1] 卡住的最后一根）
+        
+        收盘补发策略（参考 tq_gateway._flush_last_session_bar_if_needed）：
+        - 正常推送：推送 [-2] 列（已完成的 bar）
+        - 收盘补发：15:02~15:30 或 11:32~12:00 窗口内，检查 [-1] 是否为交易小节最后一根
+                   如果是且未补发过，则推送 [-1] 列
+        - 原因：15:00 后 [-1] 会卡在 150000（14:59 的 bar），不会再列变
+        """
+        if not self.subscribed:
+            return
+
+        trading_date = datetime.now(CHINA_TZ).strftime("%Y%m%d")
+        codes = sorted(self.subscribed)
+
+        # 全量获取所有已订阅合约的 K线数据
+        kline_dict = xtdata.get_full_kline([], codes, "1m", "", trading_date, 2)
+        if kline_dict is None or not isinstance(kline_dict, dict):
+            return
+
+        time_df = kline_dict.get("time")
+        if time_df is None or time_df.empty:
+            return
+
+        # 当前时间（用于收盘补发判断）
+        now = datetime.now(CHINA_TZ).replace(second=0, microsecond=0)
+        now_minute = now.hour * 60 + now.minute
+        
+        # 收盘补发窗口和目标分钟
+        target_minute: datetime | None = None
+        if 11 * 60 + 32 <= now_minute <= 12 * 60:
+            target_minute = now.replace(hour=11, minute=29)
+        elif 15 * 60 + 2 <= now_minute <= 15 * 60 + 30:
+            target_minute = now.replace(hour=14, minute=59)
+
+        # 遍历每个合约
+        for xt_symbol in codes:
+            if xt_symbol not in time_df.index:
+                continue
+
+            state = self.symbol_bar_states.get(xt_symbol)
+            if state is None:
+                continue
+
+            time_row = time_df.loc[xt_symbol]
+            valid_cols = [col for col in time_row.index if time_row[col] == time_row[col]]
+            if len(valid_cols) < 2:
+                continue
+
+            # 正常推送：处理 [-2] 列（已完成的 bar）
+            prev_column = valid_cols[-2]
+            self._process_bar_col(state, kline_dict, xt_symbol, prev_column)
+
+            # 收盘补发：检查 [-1] 是否为目标分钟
+            if target_minute is not None and state.get("last_session_flush_dt") != target_minute:
+                curr_column = valid_cols[-1]
+                curr_ms = time_row[curr_column]
+                curr_end_dt = datetime.fromtimestamp(curr_ms / 1000, tz=CHINA_TZ).replace(second=0, microsecond=0)
+                curr_dt = curr_end_dt - timedelta(minutes=1)  # XT 时间戳减 1 分钟
+                
+                if curr_dt == target_minute:
+                    # 补发 [-1] 列
+                    if self._process_bar_col(state, kline_dict, xt_symbol, curr_column):
+                        state["last_session_flush_dt"] = target_minute
+
+    def _process_bar_col(
+        self,
+        state: dict,
+        kline_dict: dict,
+        xt_symbol: str,
+        column: Any
+    ) -> bool:
+        """处理单列 K线数据（参考 tq_gateway._process_bar_row）
+        
+        Args:
+            state: 合约状态字典
+            kline_dict: K线数据字典
+            xt_symbol: XT 合约代码
+            column: DataFrame 列键（时间字符串，如 "20260520101600"）
+                   注意：XT 的 DataFrame 结构是 index=合约, columns=时间
+                        与常规时间序列（index=时间）相反
+        
+        Returns:
+            bool: 是否成功推送 bar
+        """
+        bar = state.get("bar")
+        if bar is None:
+            return False
+
+        # 获取时间戳
+        time_df = kline_dict.get("time")
+        if time_df is None or xt_symbol not in time_df.index:
+            return False
+        
+        time_row = time_df.loc[xt_symbol]
+        if column not in time_row.index:
+            return False
+        
+        timestamp_ms = time_row[column]
+        if timestamp_ms <= 0:
+            return False
+
+        # 解析时间戳（XT 返回的是分钟结束时刻，需要减 1 分钟得到起始时刻）
+        bar_end_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=CHINA_TZ).replace(second=0, microsecond=0)
+        bar_dt = bar_end_dt - timedelta(minutes=1)
+
+        # 逆序重复过滤
+        last_pushed_ms = state.get("last_closed_bar_ms")
+        if last_pushed_ms is not None and timestamp_ms <= last_pushed_ms:
+            return False
+
+        # 锚点过滤
+        anchor_minute = state.get("anchor_minute")
+        if anchor_minute and bar_dt < anchor_minute:
+            return False
+
+        # 交易时段检查
+        session_index = self._get_stock_session_index(bar_dt)
+        if session_index is None:
+            return False
+
+        # 提取 OHLCV 数据
+        # 注意：XT bar 的 openInt 字段也是证券状态编码（与 tick 相同）
+        #      实测盘中 bar 的 openInt=13（连续交易T）
+        #      期货的 openInt 可能是持仓量，需要区分品种
+        bar_data = {}
+        for field in ["open", "high", "low", "close", "volume", "openInt"]:
+            field_df = kline_dict.get(field)
+            if field_df is not None and xt_symbol in field_df.index:
+                field_row = field_df.loc[xt_symbol]
+                if column in field_row.index:
+                    bar_data[field] = field_row[column]
+
+        # 解析合约信息
+        symbol, xt_exchange = xt_symbol.split(".")
+        exchange = EXCHANGE_XT2VT.get(xt_exchange)
+        if not exchange:
+            return False
+
+        contract = symbol_contract_map.get(f"{symbol}.{exchange.value}")
+        if not contract:
+            return False
+
+        # 解析 bar 数据
+        open_price = float(bar_data.get("open", 0))
+        high_price = float(bar_data.get("high", 0))
+        low_price = float(bar_data.get("low", 0))
+        close_price = float(bar_data.get("close", 0))
+        volume = float(bar_data.get("volume", 0))
+        open_interest = float(bar_data.get("openInt", 0))
+
+        # 补漏逻辑
+        last_bar_dt = bar.datetime if last_pushed_ms is not None else None
+        if last_bar_dt is None:
+            # 首次推送：从交易小节起始填充
+            session_start_minute = STOCK_SESSION_START_MINUTES[session_index]
+            session_start = bar_dt.replace(
+                hour=session_start_minute // 60,
+                minute=session_start_minute % 60,
+                second=0,
+                microsecond=0
+            )
+            
+            fill_dt = session_start
+            while fill_dt < bar_dt:
+                bar.datetime = fill_dt
+                bar.volume = 0
+                bar.open_interest = open_interest
+                bar.open_price = open_price
+                bar.high_price = open_price
+                bar.low_price = open_price
+                bar.close_price = open_price
+                self.gateway.on_bar(copy(bar))
+                fill_dt += timedelta(minutes=1)
+        else:
+            # 后续推送：从上一根 bar+1 填充
+            fill_dt = last_bar_dt + timedelta(minutes=1)
+            fill_price = bar.close_price
+            fill_oi = bar.open_interest
+            
+            while fill_dt < bar_dt:
+                if self._get_stock_session_index(fill_dt) != session_index:
+                    break
+                bar.datetime = fill_dt
+                bar.volume = 0
+                bar.open_interest = fill_oi
+                bar.open_price = fill_price
+                bar.high_price = fill_price
+                bar.low_price = fill_price
+                bar.close_price = fill_price
+                self.gateway.on_bar(copy(bar))
+                fill_dt += timedelta(minutes=1)
+
+        # 更新当前 bar
+        bar.datetime = bar_dt
+        bar.volume = volume
+        bar.open_interest = open_interest
+        bar.open_price = open_price
+        bar.high_price = high_price
+        bar.low_price = low_price
+        bar.close_price = close_price
+        
+        # 推送当前 bar
+        self.gateway.on_bar(bar)
+
+        # 更新状态
+        state["last_closed_bar_ms"] = timestamp_ms
+        return True
+
     def get_lock(self) -> bool:
         """获取文件锁，确保单例运行"""
         self.lock = FileLock(self.lock_filepath)
@@ -396,6 +732,9 @@ class XtMdApi:
 
         # 开启使用期货真实夜盘时间
         xtdc.set_future_realtime_mode(True)
+
+        # 设置 K线镜像市场（全市场 1m 由行情侧灌入本地）
+        xtdc.set_kline_mirror_markets(["SH", "SZ", "BJ"])
 
         # 执行初始化，但不启动默认58609端口监听
         xtdc.init(False)
@@ -568,7 +907,7 @@ class XtMdApi:
                 self.gateway.on_contract(contract)
 
     def subscribe(self, req: SubscribeRequest) -> None:
-        """订阅行情"""
+        """订阅行情（批量订阅）"""
         if req.vt_symbol not in symbol_contract_map:
             return
 
@@ -578,13 +917,70 @@ class XtMdApi:
 
         xt_symbol: str = req.symbol + "." + xt_exchange
 
-        if xt_symbol not in self.subscribed:
-            xtdata.subscribe_quote(stock_code=xt_symbol, period="tick", callback=self.onMarketData)
-            self.subscribed.add(xt_symbol)
+        with self.subscribe_lock:
+            if xt_symbol in self.subscribed:
+                return  # 已订阅，跳过
+
+            # 创建 tick 状态（毫秒时间戳）
+            anchor_ms = int(time.time() * 1000)
+            self.symbol_tick_states[xt_symbol] = {
+                "anchor_ms": anchor_ms,
+                "last_tick_ms": 0,
+            }
+
+            # 创建 bar 状态（包含 bar 对象）
+            symbol, xt_exchange = xt_symbol.split(".")
+            exchange = EXCHANGE_XT2VT.get(xt_exchange)
+            
+            bar = None
+            if exchange:
+                bar = BarData(
+                    symbol=symbol,
+                    exchange=exchange,
+                    datetime=datetime.now(CHINA_TZ).replace(second=0, microsecond=0),  # 初始化为当前时间
+                    interval=Interval.MINUTE,
+                    volume=0,
+                    open_interest=0,
+                    open_price=0,
+                    high_price=0,
+                    low_price=0,
+                    close_price=0,
+                    gateway_name=self.gateway_name
+                )
+            
+            self.symbol_bar_states[xt_symbol] = {
+                "anchor_minute": datetime.now(CHINA_TZ).replace(second=0, microsecond=0),
+                "last_closed_bar_ms": None,  # None 标记未推送过 bar
+                "last_session_flush_dt": None,  # 收盘补发标记（记录已补发的目标分钟）
+                "bar": bar,  # bar 对象存在状态里
+            }
+
+            # 加入待订阅队列（新增标的）
+            self.pending_subscribe.add(xt_symbol)
+
+    def _get_stock_session_index(self, dt: datetime) -> int | None:
+        """获取股票交易时段索引"""
+        minute_of_day = dt.hour * 60 + dt.minute
+        for index, (start_minute, end_minute) in enumerate(STOCK_SESSION_WINDOWS):
+            if start_minute <= minute_of_day < end_minute:
+                return index
+        return None
 
     def close(self) -> None:
         """关闭连接"""
-        pass
+        for seq in self.whole_quote_seqs:
+            try:
+                xtdata.unsubscribe_quote(seq)
+                self.gateway.write_log(f"已反订阅全推行情 seq={seq}")
+            except Exception as ex:
+                self.gateway.write_log(f"反订阅全推行情失败 seq={seq}: {ex}")
+        self.whole_quote_seqs.clear()
+
+        with self.subscribe_lock:
+            self.pending_subscribe.clear()
+        self.subscribed.clear()
+        self.symbol_tick_states.clear()
+        self.symbol_bar_states.clear()
 
 
 class XtTdApi(XtQuantTraderCallback):
