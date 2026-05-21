@@ -131,6 +131,9 @@ STOCK_SESSION_WINDOWS: tuple[tuple[int, int], ...] = (
 STOCK_SESSION_START_MINUTES: tuple[int, ...] = tuple(start for start, _ in STOCK_SESSION_WINDOWS)
 STOCK_SESSION_END_MINUTES: tuple[int, ...] = tuple(end for _, end in STOCK_SESSION_WINDOWS)  # (690, 900) 即 11:30, 15:00
 
+TICK_WALL_CUTOFF_MINUTE: int = 15 * 60
+AUCTION_START_MINUTE: int = 9 * 60 + 25
+AUCTION_END_MINUTE: int = 9 * 60 + 30
 
 # 全局缓存字典
 symbol_contract_map: dict[str, ContractData] = {}       # 合约数据
@@ -233,21 +236,15 @@ class XtGateway(BaseGateway):
         return None
 
     def on_tick(self, tick: TickData) -> None:
-        """推送 tick 数据（带收盘过滤）"""
-        # 1. 墙钟 >= 15:00 停推（防延迟 tick 假触发信号）
+        """推送 tick 数据（准入闸门，逻辑同主分支 xt_gateway）"""
         now = datetime.now(CHINA_TZ)
         wall_minute = now.hour * 60 + now.minute
-        if wall_minute >= 15 * 60:
+        if wall_minute >= TICK_WALL_CUTOFF_MINUTE:
             return
-
-        # # 2. tick 数据时间 < 9:25 丢弃（参考 tq_gateway），暂不启用，待测试xt实际行为
-        # tick_dt = tick.datetime
-        # if tick_dt.tzinfo is None:
-        #     tick_dt = tick_dt.replace(tzinfo=CHINA_TZ)
-        # tick_minute = tick_dt.hour * 60 + tick_dt.minute
-        # if tick_minute < 9 * 60 + 25:  # 9:25
-        #     return
-
+        if tick.open_price <= 0:
+            return
+        if AUCTION_START_MINUTE <= wall_minute < AUCTION_END_MINUTE:
+            super().on_tick(copy(tick))
         super().on_tick(tick)
 
     def on_bar(self, bar: BarData) -> None:
@@ -621,12 +618,12 @@ class XtMdApi:
         if session_index is None:
             return False
 
-        # 提取 OHLCV 数据
+        # 提取 OHLCVA 数据（get_full_kline 含 amount=成交额，见 test_full_kline_poll.py §5b）
         # 注意：XT bar 的 openInt 字段也是证券状态编码（与 tick 相同）
         #      实测盘中 bar 的 openInt=13（连续交易T）
         #      期货的 openInt 可能是持仓量，需要区分品种
         bar_data = {}
-        for field in ["open", "high", "low", "close", "volume", "openInt"]:
+        for field in ["open", "high", "low", "close", "volume", "amount", "openInt"]:
             field_df = kline_dict.get(field)
             if field_df is not None and xt_symbol in field_df.index:
                 field_row = field_df.loc[xt_symbol]
@@ -649,6 +646,7 @@ class XtMdApi:
         low_price = float(bar_data.get("low", 0))
         close_price = float(bar_data.get("close", 0))
         volume = float(bar_data.get("volume", 0))
+        turnover = float(bar_data.get("amount", 0))
         open_interest = float(bar_data.get("openInt", 0))
 
         # 补漏逻辑
@@ -667,6 +665,7 @@ class XtMdApi:
             while fill_dt < bar_dt:
                 bar.datetime = fill_dt
                 bar.volume = 0
+                bar.turnover = 0
                 bar.open_interest = open_interest
                 bar.open_price = open_price
                 bar.high_price = open_price
@@ -685,6 +684,7 @@ class XtMdApi:
                     break
                 bar.datetime = fill_dt
                 bar.volume = 0
+                bar.turnover = 0
                 bar.open_interest = fill_oi
                 bar.open_price = fill_price
                 bar.high_price = fill_price
@@ -696,6 +696,7 @@ class XtMdApi:
         # 更新当前 bar
         bar.datetime = bar_dt
         bar.volume = volume
+        bar.turnover = turnover
         bar.open_interest = open_interest
         bar.open_price = open_price
         bar.high_price = high_price
