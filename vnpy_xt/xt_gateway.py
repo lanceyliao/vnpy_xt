@@ -204,6 +204,7 @@ class XtGateway(BaseGateway):
 
             self.td_api.connect(path, accountid, account_type)
             self.init_query()
+        self.event_engine.register(EVENT_TIMER, self.md_api.process_timer_event)
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
@@ -248,8 +249,8 @@ class XtGateway(BaseGateway):
         super().on_tick(tick)
 
     def on_bar(self, bar: BarData) -> None:
-        """推送K线数据"""
-        self.on_event(EVENT_BAR, bar)
+        """推送K线数据（copy 避免下游 convert_tz 原地改 datetime 污染 state['bar']）"""
+        self.on_event(EVENT_BAR, copy(bar))
 
     def on_order(self, order: OrderData) -> None:
         """推送委托数据"""
@@ -279,9 +280,6 @@ class XtGateway(BaseGateway):
         func = self.query_functions.pop(0)
         func()
         self.query_functions.append(func)
-
-        # 每秒触发行情 API 的定时任务
-        self.md_api.process_timer()
 
     def init_query(self) -> None:
         """初始化查询任务"""
@@ -459,14 +457,16 @@ class XtMdApi:
             self.gateway.write_log(f"迅投研数据服务初始化失败，发生异常：{ex}")
             return
 
-        self.inited = True
-
         self.gateway.write_log("行情接口连接成功")
 
         self.query_contracts()
+        self.inited = True
 
-    def process_timer(self) -> None:
-        """定时任务（每秒触发）"""
+    def process_timer_event(self, event: Event) -> None:
+        """定时任务（每秒触发；未 inited 时跳过，subscribe 可先入 pending）"""
+        if not self.inited:
+            return
+
         # 批量订阅新增标的
         self._batch_subscribe()
         
@@ -474,13 +474,27 @@ class XtMdApi:
         self._poll_kline()
 
     def _batch_subscribe(self) -> None:
-        """批量订阅新增标的"""
+        """批量订阅新增标的（合约未入库的留在 pending，下秒重试）"""
         with self.subscribe_lock:
             if not self.pending_subscribe:
                 return
 
-            new_codes = sorted(self.pending_subscribe)
-            self.pending_subscribe.clear()
+            ready: list[str] = []
+            not_ready: set[str] = set()
+            for xt_symbol in self.pending_subscribe:
+                symbol, xt_exchange = xt_symbol.split(".", 1)
+                exchange = EXCHANGE_XT2VT.get(xt_exchange)
+                vt_symbol = f"{symbol}.{exchange.value}" if exchange else ""
+                if vt_symbol and vt_symbol in symbol_contract_map:
+                    ready.append(xt_symbol)
+                else:
+                    not_ready.add(xt_symbol)
+            self.pending_subscribe = not_ready
+
+        if not ready:
+            return
+
+        new_codes = sorted(ready)
 
         # 批量注册 K线全推（首次调用 get_full_kline 注册客户端 1m 全推）
         # 注意：后续 _poll_kline 会全量获取所有已订阅合约的 K线，不是增量
@@ -528,9 +542,9 @@ class XtMdApi:
         # 收盘补发窗口和目标分钟
         target_minute: datetime | None = None
         if 11 * 60 + 32 <= now_minute <= 12 * 60:
-            target_minute = now.replace(hour=11, minute=29)
+            target_minute = now.replace(hour=11, minute=29, tzinfo=CHINA_TZ)
         elif 15 * 60 + 2 <= now_minute <= 15 * 60 + 30:
-            target_minute = now.replace(hour=14, minute=59)
+            target_minute = now.replace(hour=14, minute=59, tzinfo=CHINA_TZ)
 
         # 遍历每个合约
         for xt_symbol in codes:
@@ -671,7 +685,7 @@ class XtMdApi:
                 bar.high_price = open_price
                 bar.low_price = open_price
                 bar.close_price = open_price
-                self.gateway.on_bar(copy(bar))
+                self.gateway.on_bar(bar)
                 fill_dt += timedelta(minutes=1)
         else:
             # 后续推送：从上一根 bar+1 填充
@@ -690,7 +704,7 @@ class XtMdApi:
                 bar.high_price = fill_price
                 bar.low_price = fill_price
                 bar.close_price = fill_price
-                self.gateway.on_bar(copy(bar))
+                self.gateway.on_bar(bar)
                 fill_dt += timedelta(minutes=1)
 
         # 更新当前 bar
@@ -908,10 +922,7 @@ class XtMdApi:
                 self.gateway.on_contract(contract)
 
     def subscribe(self, req: SubscribeRequest) -> None:
-        """订阅行情（批量订阅）"""
-        if req.vt_symbol not in symbol_contract_map:
-            return
-
+        """订阅行情（先入 pending，合约表入库后由定时任务批量发出）"""
         xt_exchange: str = EXCHANGE_VT2XT[req.exchange]
         if xt_exchange in {"SH", "SZ"} and len(req.symbol) > 6:
             xt_exchange += "O"
@@ -1338,13 +1349,9 @@ class XtTdApi(XtQuantTraderCallback):
 
 
 def generate_datetime(timestamp: int, millisecond: bool = True) -> datetime:
-    """生成本地时间"""
-    if millisecond:
-        dt: datetime = datetime.fromtimestamp(timestamp / 1000)
-    else:
-        dt = datetime.fromtimestamp(timestamp)
-    dt = dt.replace(tzinfo=CHINA_TZ)
-    return dt
+    """生成带 Asia/Shanghai 时区的时间"""
+    ts = timestamp / 1000 if millisecond else timestamp
+    return datetime.fromtimestamp(ts, tz=CHINA_TZ)
 
 
 def process_etf_option(get_instrument_detail: Callable, xt_symbol: str, gateway_name: str) -> ContractData | None:
