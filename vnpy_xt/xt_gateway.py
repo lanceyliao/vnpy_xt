@@ -61,6 +61,7 @@ from .xt_config import VIP_ADDRESS_LIST, LISTEN_PORT
 
 # 事件类型
 EVENT_BAR = "eBarGen"
+EVENT_BAR_RECORD = "eBarGenRec"
 
 # 交易所映射
 EXCHANGE_VT2XT: dict[Exchange, str] = {
@@ -250,7 +251,9 @@ class XtGateway(BaseGateway):
 
     def on_bar(self, bar: BarData) -> None:
         """推送K线数据（copy 避免下游 convert_tz 原地改 datetime 污染 state['bar']）"""
-        self.on_event(EVENT_BAR, copy(bar))
+        bar_copy = copy(bar)
+        self.on_event(EVENT_BAR, bar_copy)
+        self.on_event(EVENT_BAR_RECORD, bar_copy)
 
     def on_order(self, order: OrderData) -> None:
         """推送委托数据"""
