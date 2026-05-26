@@ -544,9 +544,9 @@ class XtMdApi:
         
         # 收盘补发窗口和目标分钟
         target_minute: datetime | None = None
-        if 11 * 60 + 32 <= now_minute <= 12 * 60:
+        if 11 * 60 + 31 <= now_minute <= 12 * 60:
             target_minute = now.replace(hour=11, minute=29, tzinfo=CHINA_TZ)
-        elif 15 * 60 + 2 <= now_minute <= 15 * 60 + 30:
+        elif 15 * 60 + 1 <= now_minute <= 15 * 60 + 30:
             target_minute = now.replace(hour=14, minute=59, tzinfo=CHINA_TZ)
 
         # 遍历每个合约
