@@ -254,6 +254,7 @@ class XtGateway(BaseGateway):
         bar_copy = copy(bar)
         self.on_event(EVENT_BAR, bar_copy)
         self.on_event(EVENT_BAR_RECORD, bar_copy)
+        self.write_log(f"bar received {bar}")
 
     def on_order(self, order: OrderData) -> None:
         """推送委托数据"""
